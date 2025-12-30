@@ -8,6 +8,25 @@ from pathlib import Path
 from shepherd.lightning_module import LightningModule
 from shepherd.checkpoint_manager import get_checkpoint_path
 
+# for weights_only loading to work
+import numpy as np
+import numpy
+from torch.serialization import safe_globals
+_WEIGHTS_ONLY_SAFE_GLOBALS = [
+    (np.core.multiarray._reconstruct, "numpy.core.multiarray._reconstruct"),
+    (np.ndarray, "numpy.ndarray"),
+    (np.dtype, "numpy.dtype"),
+    (np.dtypes.Int64DType, "numpy.dtypes.Int64DType"),
+    (np.dtypes.Float64DType, "numpy.dtypes.Float64DType"),
+]
+def _load_pl_checkpoint_weights_only(path: str, device_obj: torch.device) -> LightningModule:
+    # Restrict the allowlist to just this load
+    with safe_globals(_WEIGHTS_ONLY_SAFE_GLOBALS):
+        return LightningModule.load_from_checkpoint(
+            path,
+            weights_only=True,
+            map_location=device_obj,
+        )
 
 def load_model(
     model_type: Literal['mosesaq', 'gdb_x2', 'gdb_x3', 'gdb_x4'] = 'mosesaq',
@@ -58,11 +77,7 @@ def load_model(
     if local_checkpoint_path is not None:
         try:
             device_obj = torch.device(device)
-            model_pl = LightningModule.load_from_checkpoint(
-                local_checkpoint_path,
-                weights_only=True,
-                map_location=device_obj
-            )
+            model_pl = _load_pl_checkpoint_weights_only(local_checkpoint_path, device_obj)
 
             model_pl.eval()
             model_pl.model.device = device_obj
@@ -85,11 +100,7 @@ def load_model(
         print(f"Using device: {device}")
 
         device_obj = torch.device(device)
-        model_pl = LightningModule.load_from_checkpoint(
-            model_path,
-            weights_only=True,
-            map_location=device_obj
-        )
+        model_pl = _load_pl_checkpoint_weights_only(str(model_path), device_obj)
 
         model_pl.eval()
         model_pl.model.device = device_obj
