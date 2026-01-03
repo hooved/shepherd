@@ -13,6 +13,7 @@ import logging
 from rdkit import Chem
 
 from shepherd.lightning_module import LightningModule
+from shepherd import load_model
 from shepherd.inference import inference_sample
 from shepherd.extract import create_rdkit_molecule
 
@@ -59,7 +60,8 @@ def main():
 
     try:
         # load the model
-        model_pl = LightningModule.load_from_checkpoint(args.checkpoint)
+        #model_pl = LightningModule.load_from_checkpoint(args.checkpoint)
+        model_pl = load_model("mosesaq", device=device)
         model_pl.eval()
         model_pl.to(device)
         model_pl.model.device = device
