@@ -1,92 +1,54 @@
 #!/usr/bin/env python3
 """
-End-to-end conformer generation pipeline for ShEPhERD training data (v2 with validation).
+End-to-end conformer generation pipeline for ShEPhERD training data.
+v3: Adds parallel xTB optimization across conformers.
 
 This script demonstrates the full pipeline from SMILES to training-ready data:
 1. RDKit ETKDG embedding
 2. MMFF94 optimization
 3. Conformer ensemble generation & clustering
-4. xTB optimization in water (ALPB implicit solvent)
+4. xTB optimization in water (ALPB implicit solvent) -- NOW PARALLELIZED
 5. Final clustering and charge extraction
 6. Serialization to pickle format
+
+=============================================================================
+PARALLELISM
+=============================================================================
+
+The --workers flag controls how many xTB processes run in parallel:
+
+  # Use 4 parallel workers (recommended: num_cpus / 2 to num_cpus)
+  python conformer_pipeline_e2e_v3_parallel.py --smiles "..." --workers 4
+
+  # Use all available CPUs
+  python conformer_pipeline_e2e_v3_parallel.py --smiles "..." --workers -1
+
+How it works:
+- Conformers are distributed across worker processes
+- Each worker runs xTB sequentially on its assigned conformers
+- Results are collected and merged at the end
+
+Speedup expectations:
+- Near-linear speedup up to ~8 workers (depends on I/O and molecule size)
+- Diminishing returns beyond that due to I/O overhead from xTB temp files
 
 =============================================================================
 USAGE EXAMPLES
 =============================================================================
 
-1. Generate conformers for a single molecule:
-   python conformer_pipeline_e2e_v2.py --smiles "CCO" --profile
+1. Generate conformers with parallel xTB (4 workers):
+   python conformer_pipeline_e2e_v3_parallel.py --smiles "CCO" --workers 4 --profile
 
-2. Generate conformers for a drug-like molecule with output:
-   python conformer_pipeline_e2e_v2.py \\
+2. Process a drug-like molecule:
+   python conformer_pipeline_e2e_v3_parallel.py \\
        --smiles "Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1" \\
        --num-confs 100 \\
+       --workers 8 \\
        --output my_conformers.pkl \\
        --profile
 
-3. VALIDATE the pipeline against reference data:
-   python conformer_pipeline_e2e_v2.py --validate
-
-4. Validate with more molecules (slower but more thorough):
-   python conformer_pipeline_e2e_v2.py --validate --validate-n 10
-
-=============================================================================
-VALIDATION GUIDE
-=============================================================================
-
-The --validate flag tests the pipeline against pre-computed reference data in:
-  data/conformers/moses_aq/example_molblock_charges.pkl
-
-WHAT THE VALIDATION CHECKS:
----------------------------
-1. Charge RMSE < 0.01 (default tolerance)
-   - Measures average deviation in partial charges per atom
-   - Small differences (0.001-0.005) are normal due to different conformers
-   - Large differences (>0.01) suggest xTB or solvent settings are wrong
-
-2. Charge Correlation >= 0.999 (default tolerance)
-   - Measures whether charge patterns match (which atoms are +/- charged)
-   - Should be very close to 1.0 if xTB is working correctly
-   - Low correlation suggests fundamental issues with the pipeline
-
-3. Charge Sum ~= 0 for neutral molecules
-   - xTB charges should sum to the formal charge (0 for neutral)
-   - Non-zero sums indicate charge extraction bugs
-
-WHY SMALL DIFFERENCES ARE EXPECTED:
------------------------------------
-- ETKDG uses random seeds -> different initial conformers
-- xTB optimization may converge to different local minima
-- Different num_confs or clustering thresholds affect which conformers survive
-- The reference data was generated with specific (unknown) random seeds
-
-WHAT TO LOOK FOR IN FAILURES:
------------------------------
-- If charge correlation is low (<0.99): Check xTB installation, solvent flag
-- If charge RMSE is high (>0.05): May indicate different xTB version or settings
-- If charges don't sum to ~0: Check charge extraction from xTB output files
-- If validation fails on ALL molecules: Likely a systematic issue (xTB not found, etc.)
-- If validation fails on SOME molecules: May be edge cases or stereochemistry issues
-
-MANUAL VALIDATION:
-------------------
-You can also manually inspect generated conformers:
-
-    import pickle
-    from rdkit import Chem
-
-    with open('my_conformers.pkl', 'rb') as f:
-        data = pickle.load(f)
-
-    molblock, charges = data[0]
-    mol = Chem.MolFromMolBlock(molblock, removeHs=False)
-
-    # Check charges sum to formal charge
-    print(f"Charge sum: {sum(charges):.6f}")
-
-    # Visualize
-    from rdkit.Chem import Draw
-    Draw.MolToImage(mol)
+3. Validate pipeline (uses sequential processing for reproducibility):
+   python conformer_pipeline_e2e_v3_parallel.py --validate
 
 =============================================================================
 """
@@ -95,8 +57,10 @@ import argparse
 import pickle
 import time
 import sys
+import os
+import multiprocessing as mp
 from pathlib import Path
-from functools import wraps
+from functools import wraps, partial
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 import numpy as np
@@ -124,9 +88,9 @@ from shepherd.shepherd_score_utils.conformer_generation import (
 @dataclass
 class ValidationTolerances:
     """Tolerances for validation tests."""
-    max_charge_rmse: float = 0.01      # Maximum allowed charge RMSE
-    min_charge_corr: float = 0.999     # Minimum allowed charge correlation
-    max_charge_sum_deviation: float = 0.01  # Max deviation from expected charge sum
+    max_charge_rmse: float = 0.01
+    min_charge_corr: float = 0.999
+    max_charge_sum_deviation: float = 0.01
 
     def __str__(self):
         return (
@@ -194,6 +158,105 @@ def timed(name: str):
 
 
 # =============================================================================
+# PARALLEL XTB OPTIMIZATION
+# =============================================================================
+
+def _xtb_worker(args: Tuple) -> Tuple:
+    """
+    Worker function for parallel xTB optimization.
+
+    Args:
+        args: Tuple of (conformer_molblock, solvent, charge, worker_id)
+
+    Returns:
+        Tuple of (opt_molblock, energy, charges) or (None, None, None) on failure
+    """
+    molblock, solvent, charge = args
+
+    try:
+        # Reconstruct mol from molblock (can't pickle RDKit mol objects directly)
+        mol = Chem.MolFromMolBlock(molblock, removeHs=False)
+        if mol is None:
+            return (None, None, None)
+
+        # Run xTB optimization
+        opt_mol, energy, charges = optimize_conformer_with_xtb(
+            mol,
+            solvent=solvent,
+            num_cores=1,  # Each worker uses 1 core
+            charge=charge,
+        )
+
+        # Convert back to molblock for return
+        opt_molblock = Chem.MolToMolBlock(opt_mol)
+        return (opt_molblock, energy, charges)
+
+    except Exception as e:
+        # Return None on any failure
+        return (None, None, None)
+
+
+def optimize_conformers_parallel(
+    conformers: List,
+    solvent: str = "water",
+    charge: int = 0,
+    num_workers: int = 4,
+    verbose: bool = True,
+) -> Tuple[List, List, List]:
+    """
+    Parallel xTB optimization of conformers using multiprocessing.
+
+    Args:
+        conformers: List of RDKit mol objects
+        solvent: Solvent for xTB ALPB
+        charge: Molecular charge
+        num_workers: Number of parallel workers (-1 for all CPUs)
+        verbose: Print progress
+
+    Returns:
+        Tuple of (optimized_conformers, energies, charges)
+    """
+    if num_workers == -1:
+        num_workers = mp.cpu_count()
+
+    # Convert conformers to molblocks (picklable)
+    molblocks = [Chem.MolToMolBlock(conf) for conf in conformers]
+
+    # Prepare arguments for workers
+    worker_args = [(mb, solvent, charge) for mb in molblocks]
+
+    if verbose:
+        print(f"     Parallelizing xTB across {num_workers} workers for {len(conformers)} conformers...")
+
+    # Run parallel optimization
+    with mp.Pool(num_workers) as pool:
+        results = pool.map(_xtb_worker, worker_args)
+
+    # Collect results
+    opt_conformers = []
+    energies = []
+    charges_list = []
+
+    n_failed = 0
+    for opt_molblock, energy, charges in results:
+        if opt_molblock is not None:
+            opt_mol = Chem.MolFromMolBlock(opt_molblock, removeHs=False)
+            opt_mol.SetProp("energy", str(energy))
+            for i, q in enumerate(charges):
+                opt_mol.GetAtomWithIdx(i).SetProp('charge', str(q))
+            opt_conformers.append(opt_mol)
+            energies.append(energy)
+            charges_list.append(charges)
+        else:
+            n_failed += 1
+
+    if verbose and n_failed > 0:
+        print(f"     Warning: {n_failed} conformers failed xTB optimization")
+
+    return opt_conformers, energies, charges_list
+
+
+# =============================================================================
 # PIPELINE STEPS (with profiling)
 # =============================================================================
 
@@ -228,14 +291,27 @@ def step_cluster(conformers, threshold: float = 0.1):
     return [conformers[i] for i in clustered_indices]
 
 
-@timed("4. xTB optimization (water solvent)")
-def step_xtb_optimize(conformers, solvent: str = "water", num_processes: int = 1, charge: int = 0):
-    """Optimize conformers with GFN2-xTB in implicit solvent."""
+@timed("4. xTB optimization (water solvent) - SEQUENTIAL")
+def step_xtb_optimize_sequential(conformers, solvent: str = "water", charge: int = 0):
+    """Optimize conformers with GFN2-xTB in implicit solvent (sequential)."""
     opt_conformers, opt_energies, opt_charges = optimize_conformer_ensemble_with_xtb(
         conformers,
         solvent=solvent,
-        num_processes=num_processes,
+        num_processes=1,
         charge=charge,
+        verbose=True,
+    )
+    return opt_conformers, opt_energies, opt_charges
+
+
+@timed("4. xTB optimization (water solvent) - PARALLEL")
+def step_xtb_optimize_parallel(conformers, solvent: str = "water", charge: int = 0, num_workers: int = 4):
+    """Optimize conformers with GFN2-xTB in implicit solvent (parallel)."""
+    opt_conformers, opt_energies, opt_charges = optimize_conformers_parallel(
+        conformers,
+        solvent=solvent,
+        charge=charge,
+        num_workers=num_workers,
         verbose=True,
     )
     return opt_conformers, opt_energies, opt_charges
@@ -269,7 +345,13 @@ def step_to_training_format(conformers, charges):
 # PIPELINE RUNNERS
 # =============================================================================
 
-def run_pipeline_stepwise(smiles: str, solvent: str = "water", num_confs: int = 100, verbose: bool = True):
+def run_pipeline_stepwise(
+    smiles: str,
+    solvent: str = "water",
+    num_confs: int = 100,
+    num_workers: int = 1,
+    verbose: bool = True,
+):
     """
     Run the full pipeline step-by-step with individual profiling.
 
@@ -277,6 +359,7 @@ def run_pipeline_stepwise(smiles: str, solvent: str = "water", num_confs: int = 
         smiles: Input SMILES string
         solvent: Solvent for xTB (default: "water")
         num_confs: Number of initial conformers to generate
+        num_workers: Number of parallel workers for xTB (1 = sequential)
         verbose: Print progress info
 
     Returns:
@@ -286,14 +369,16 @@ def run_pipeline_stepwise(smiles: str, solvent: str = "water", num_confs: int = 
         print(f"\nProcessing: {smiles}")
         print(f"Solvent: {solvent}")
         print(f"Initial conformers: {num_confs}")
+        print(f"xTB workers: {num_workers if num_workers > 0 else 'all CPUs'}")
         print("-" * 40)
 
     # Step 1: Embed
     mol_3d = step_embed(smiles, mmff_optimize=True)
     if mol_3d is None:
         raise ValueError(f"Failed to embed SMILES: {smiles}")
+    formal_charge = Chem.GetFormalCharge(mol_3d)
     if verbose:
-        print(f"[ok] Embedded molecule: {mol_3d.GetNumAtoms()} atoms (with H)")
+        print(f"[ok] Embedded molecule: {mol_3d.GetNumAtoms()} atoms (with H), charge={formal_charge}")
 
     # Step 2: Generate conformer ensemble
     conformer_ensemble = step_generate_ensemble(mol_3d, num_confs=num_confs)
@@ -305,15 +390,25 @@ def run_pipeline_stepwise(smiles: str, solvent: str = "water", num_confs: int = 
     if verbose:
         print(f"[ok] Clustered to {len(clustered_conformers)} unique conformers")
 
-    # Step 4: xTB optimization
-    opt_conformers, opt_energies, opt_charges = step_xtb_optimize(
-        clustered_conformers,
-        solvent=solvent,
-        charge=Chem.GetFormalCharge(mol_3d),
-    )
+    # Step 4: xTB optimization (parallel or sequential)
+    if num_workers == 1:
+        opt_conformers, opt_energies, opt_charges = step_xtb_optimize_sequential(
+            clustered_conformers,
+            solvent=solvent,
+            charge=formal_charge,
+        )
+    else:
+        opt_conformers, opt_energies, opt_charges = step_xtb_optimize_parallel(
+            clustered_conformers,
+            solvent=solvent,
+            charge=formal_charge,
+            num_workers=num_workers,
+        )
+
     if verbose:
         print(f"[ok] xTB optimized {len(opt_conformers)} conformers")
-        print(f"     Energy range: {min(opt_energies):.4f} to {max(opt_energies):.4f} Ha")
+        if opt_energies:
+            print(f"     Energy range: {min(opt_energies):.4f} to {max(opt_energies):.4f} Ha")
 
     # Step 5: Final clustering
     final_conformers, final_energies, final_charges = step_final_cluster(
@@ -333,13 +428,13 @@ def run_pipeline_stepwise(smiles: str, solvent: str = "water", num_confs: int = 
 def run_pipeline_integrated(smiles: str, solvent: str = "water", num_confs: int = 100, verbose: bool = True):
     """
     Run the integrated pipeline using generate_opt_conformers_xtb().
-    This is the "production" function that does everything in one call.
+    This is the "production" function (sequential only).
     """
     start = time.perf_counter()
 
     conformers, energies, charges = generate_opt_conformers_xtb(
         smiles,
-        charge=0,  # Will be computed from SMILES
+        charge=0,
         solvent=solvent,
         MMFF_optimize=True,
         num_processes=1,
@@ -353,7 +448,6 @@ def run_pipeline_integrated(smiles: str, solvent: str = "water", num_confs: int 
     if conformers is None:
         raise ValueError(f"Failed to generate conformers for: {smiles}")
 
-    # Convert to training format
     molblocks_and_charges = []
     for conf, charge in zip(conformers, charges):
         mol_block = Chem.MolToMolBlock(conf)
@@ -363,7 +457,7 @@ def run_pipeline_integrated(smiles: str, solvent: str = "water", num_confs: int 
 
 
 # =============================================================================
-# VALIDATION
+# VALIDATION (unchanged from v2)
 # =============================================================================
 
 @dataclass
@@ -390,22 +484,7 @@ def validate_single_molecule(
     num_confs: int = 50,
     verbose: bool = True,
 ) -> ValidationResult:
-    """
-    Validate pipeline by regenerating conformers for a reference molecule
-    and comparing charges.
-
-    Args:
-        ref_molblock: Reference mol block string
-        ref_charges: Reference xTB charges
-        index: Index in reference dataset (for reporting)
-        tolerances: Validation tolerances
-        num_confs: Number of conformers to generate
-        verbose: Print progress
-
-    Returns:
-        ValidationResult with comparison metrics
-    """
-    # Extract SMILES from reference
+    """Validate pipeline by regenerating conformers and comparing charges."""
     ref_mol = Chem.MolFromMolBlock(ref_molblock, removeHs=False)
     smiles = Chem.MolToSmiles(Chem.RemoveHs(ref_mol))
     n_atoms = ref_mol.GetNumAtoms()
@@ -416,7 +495,6 @@ def validate_single_molecule(
         print(f"\n  [{index}] {smiles_display}")
         print(f"      Atoms: {n_atoms}")
 
-    # Regenerate conformers
     try:
         conformers, energies, charges_list = generate_opt_conformers_xtb(
             smiles,
@@ -428,42 +506,26 @@ def validate_single_molecule(
         )
     except Exception as e:
         return ValidationResult(
-            index=index,
-            smiles=smiles,
-            n_atoms=n_atoms,
-            n_conformers_generated=0,
-            charge_rmse=float('inf'),
-            charge_mae=float('inf'),
-            charge_corr=0.0,
-            charge_sum_ref=float(ref_charges.sum()),
-            charge_sum_gen=float('nan'),
-            passed=False,
-            failure_reasons=[f"Generation failed: {e}"],
+            index=index, smiles=smiles, n_atoms=n_atoms, n_conformers_generated=0,
+            charge_rmse=float('inf'), charge_mae=float('inf'), charge_corr=0.0,
+            charge_sum_ref=float(ref_charges.sum()), charge_sum_gen=float('nan'),
+            passed=False, failure_reasons=[f"Generation failed: {e}"],
         )
 
     if conformers is None or len(conformers) == 0:
         return ValidationResult(
-            index=index,
-            smiles=smiles,
-            n_atoms=n_atoms,
-            n_conformers_generated=0,
-            charge_rmse=float('inf'),
-            charge_mae=float('inf'),
-            charge_corr=0.0,
-            charge_sum_ref=float(ref_charges.sum()),
-            charge_sum_gen=float('nan'),
-            passed=False,
-            failure_reasons=["No conformers generated"],
+            index=index, smiles=smiles, n_atoms=n_atoms, n_conformers_generated=0,
+            charge_rmse=float('inf'), charge_mae=float('inf'), charge_corr=0.0,
+            charge_sum_ref=float(ref_charges.sum()), charge_sum_gen=float('nan'),
+            passed=False, failure_reasons=["No conformers generated"],
         )
 
-    # Find best matching conformer by charge RMSE
     best_rmse = float('inf')
     best_charges = None
-
     for charges in charges_list:
         charges = np.array(charges)
         if len(charges) != len(ref_charges):
-            continue  # Atom count mismatch
+            continue
         rmse = np.sqrt(np.mean((charges - ref_charges)**2))
         if rmse < best_rmse:
             best_rmse = rmse
@@ -471,27 +533,18 @@ def validate_single_molecule(
 
     if best_charges is None:
         return ValidationResult(
-            index=index,
-            smiles=smiles,
-            n_atoms=n_atoms,
-            n_conformers_generated=len(conformers),
-            charge_rmse=float('inf'),
-            charge_mae=float('inf'),
-            charge_corr=0.0,
-            charge_sum_ref=float(ref_charges.sum()),
-            charge_sum_gen=float('nan'),
-            passed=False,
-            failure_reasons=["Atom count mismatch between reference and generated"],
+            index=index, smiles=smiles, n_atoms=n_atoms, n_conformers_generated=len(conformers),
+            charge_rmse=float('inf'), charge_mae=float('inf'), charge_corr=0.0,
+            charge_sum_ref=float(ref_charges.sum()), charge_sum_gen=float('nan'),
+            passed=False, failure_reasons=["Atom count mismatch"],
         )
 
-    # Compute metrics
     charge_rmse = best_rmse
     charge_mae = float(np.mean(np.abs(best_charges - ref_charges)))
     charge_corr = float(np.corrcoef(ref_charges, best_charges)[0, 1])
     charge_sum_ref = float(ref_charges.sum())
     charge_sum_gen = float(best_charges.sum())
 
-    # Check tolerances
     failure_reasons = []
     if charge_rmse > tolerances.max_charge_rmse:
         failure_reasons.append(f"charge_rmse={charge_rmse:.6f} > {tolerances.max_charge_rmse}")
@@ -513,17 +566,10 @@ def validate_single_molecule(
                 print(f"        - {reason}")
 
     return ValidationResult(
-        index=index,
-        smiles=smiles,
-        n_atoms=n_atoms,
-        n_conformers_generated=len(conformers),
-        charge_rmse=charge_rmse,
-        charge_mae=charge_mae,
-        charge_corr=charge_corr,
-        charge_sum_ref=charge_sum_ref,
-        charge_sum_gen=charge_sum_gen,
-        passed=passed,
-        failure_reasons=failure_reasons,
+        index=index, smiles=smiles, n_atoms=n_atoms, n_conformers_generated=len(conformers),
+        charge_rmse=charge_rmse, charge_mae=charge_mae, charge_corr=charge_corr,
+        charge_sum_ref=charge_sum_ref, charge_sum_gen=charge_sum_gen,
+        passed=passed, failure_reasons=failure_reasons,
     )
 
 
@@ -534,19 +580,7 @@ def run_validation(
     num_confs: int = 50,
     verbose: bool = True,
 ) -> Tuple[List[ValidationResult], bool]:
-    """
-    Run validation against reference data.
-
-    Args:
-        reference_pkl: Path to reference pickle file
-        n_molecules: Number of molecules to test
-        tolerances: Validation tolerances
-        num_confs: Number of conformers to generate per molecule
-        verbose: Print progress
-
-    Returns:
-        Tuple of (list of ValidationResults, overall_passed)
-    """
+    """Run validation against reference data."""
     print("\n" + "="*70)
     print("VALIDATION MODE")
     print("="*70)
@@ -556,14 +590,11 @@ def run_validation(
     print(f"\nTolerances:")
     print(tolerances)
 
-    # Load reference data
     with open(reference_pkl, 'rb') as f:
         reference_data = pickle.load(f)
 
     print(f"\nLoaded {len(reference_data)} reference molecules")
 
-    # Select molecules to test (prefer smaller ones for speed, but diverse sizes)
-    # Sort by atom count and sample across the range
     mol_sizes = []
     for i, (molblock, charges) in enumerate(reference_data):
         mol = Chem.MolFromMolBlock(molblock, removeHs=False)
@@ -572,19 +603,11 @@ def run_validation(
 
     mol_sizes.sort(key=lambda x: x[1])
 
-    # Sample molecules across size range, preferring smaller ones
-    # Take from small, medium-small, medium ranges
-    n_total = len(mol_sizes)
-    test_indices = []
-
-    # Prefer molecules with 15-35 atoms (typical drug-like size, reasonable speed)
     preferred = [(i, n) for i, n in mol_sizes if 15 <= n <= 35]
     if len(preferred) >= n_molecules:
-        # Sample evenly from preferred range
         step = len(preferred) // n_molecules
         test_indices = [preferred[i * step][0] for i in range(n_molecules)]
     else:
-        # Fall back to smallest available
         test_indices = [mol_sizes[i][0] for i in range(min(n_molecules, len(mol_sizes)))]
 
     print(f"Selected molecule indices: {test_indices}")
@@ -592,7 +615,6 @@ def run_validation(
     print("Running validation...")
     print("-"*70)
 
-    # Run validation
     results = []
     for idx in test_indices:
         molblock, charges = reference_data[idx]
@@ -606,7 +628,6 @@ def run_validation(
         )
         results.append(result)
 
-    # Summary
     n_passed = sum(1 for r in results if r.passed)
     n_failed = len(results) - n_passed
     overall_passed = n_failed == 0
@@ -632,7 +653,6 @@ def run_validation(
         print("\n[VALIDATION PASSED] Pipeline produces charges consistent with reference data")
     else:
         print(f"\n[VALIDATION FAILED] {n_failed} molecule(s) failed tolerance checks")
-        print("\nSee 'VALIDATION GUIDE' in script docstring for troubleshooting tips")
 
     return results, overall_passed
 
@@ -641,7 +661,6 @@ def run_validation(
 # MAIN
 # =============================================================================
 
-# Example molecules for testing
 EXAMPLE_SMILES = {
     "ethanol": "CCO",
     "aspirin": "CC(=O)OC1=CC=CC=C1C(=O)O",
@@ -653,18 +672,18 @@ EXAMPLE_SMILES = {
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Conformer generation pipeline for ShEPhERD (v2 with validation)",
+        description="Conformer generation pipeline for ShEPhERD (v3 with parallel xTB)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate conformers for a molecule
-  python conformer_pipeline_e2e_v2.py --smiles "CCO" --profile
+  # Generate conformers with 4 parallel xTB workers
+  python conformer_pipeline_e2e_v3_parallel.py --smiles "CCO" --workers 4 --profile
 
-  # Validate pipeline against reference data
-  python conformer_pipeline_e2e_v2.py --validate
+  # Use all CPUs
+  python conformer_pipeline_e2e_v3_parallel.py --smiles "CCO" --workers -1 --profile
 
-  # Validate with custom tolerances
-  python conformer_pipeline_e2e_v2.py --validate --validate-n 10 --max-charge-rmse 0.02
+  # Validate pipeline
+  python conformer_pipeline_e2e_v3_parallel.py --validate
         """
     )
 
@@ -680,7 +699,11 @@ Examples:
     parser.add_argument("--profile", action="store_true",
                         help="Enable profiling report")
     parser.add_argument("--integrated", action="store_true",
-                        help="Use integrated pipeline function instead of step-by-step")
+                        help="Use integrated pipeline (sequential only)")
+
+    # Parallelism options
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel xTB workers (default: 1, -1 for all CPUs)")
 
     # Validation options
     parser.add_argument("--validate", action="store_true",
@@ -690,7 +713,7 @@ Examples:
     parser.add_argument("--validate-confs", type=int, default=50,
                         help="Conformers per molecule in validation (default: 50)")
     parser.add_argument("--reference-pkl", type=str, default=None,
-                        help="Path to reference pickle file (default: moses_aq example)")
+                        help="Path to reference pickle file")
 
     # Tolerance options
     parser.add_argument("--max-charge-rmse", type=float, default=0.01,
@@ -700,7 +723,6 @@ Examples:
 
     args = parser.parse_args()
 
-    # Build tolerances
     tolerances = ValidationTolerances(
         max_charge_rmse=args.max_charge_rmse,
         min_charge_corr=args.min_charge_corr,
@@ -708,17 +730,14 @@ Examples:
 
     # Validation mode
     if args.validate:
-        # Find reference data
         if args.reference_pkl:
             reference_pkl = Path(args.reference_pkl)
         else:
-            # Default to moses_aq example
             script_dir = Path(__file__).parent
             reference_pkl = script_dir.parent / "data" / "conformers" / "moses_aq" / "example_molblock_charges.pkl"
 
         if not reference_pkl.exists():
             print(f"ERROR: Reference file not found: {reference_pkl}")
-            print("Specify --reference-pkl or ensure moses_aq example data exists")
             sys.exit(1)
 
         results, passed = run_validation(
@@ -728,20 +747,18 @@ Examples:
             num_confs=args.validate_confs,
             verbose=True,
         )
-
         sys.exit(0 if passed else 1)
 
     # Generation mode
     if args.smiles is None:
-        args.smiles = "CCO"  # Default to ethanol
+        args.smiles = "CCO"
 
     print("\n" + "="*70)
-    print("ShEPhERD Conformer Generation Pipeline (v2)")
+    print("ShEPhERD Conformer Generation Pipeline (v3 - parallel xTB)")
     print("="*70)
 
-    # Run pipeline
     if args.integrated:
-        print("\nRunning INTEGRATED pipeline...")
+        print("\nRunning INTEGRATED pipeline (sequential)...")
         molblocks_and_charges = run_pipeline_integrated(
             args.smiles,
             solvent=args.solvent,
@@ -754,17 +771,16 @@ Examples:
             args.smiles,
             solvent=args.solvent,
             num_confs=args.num_confs,
+            num_workers=args.workers,
             verbose=True,
         )
 
-    # Save output
     if args.output:
         output_path = Path(args.output)
         with open(output_path, 'wb') as f:
             pickle.dump(molblocks_and_charges, f)
         print(f"\n[ok] Saved {len(molblocks_and_charges)} conformers to {output_path}")
 
-    # Show sample output
     print("\n" + "-"*40)
     print("Sample output (first conformer):")
     print(f"  MolBlock length: {len(molblocks_and_charges[0][0])} chars")
@@ -772,7 +788,6 @@ Examples:
     print(f"  Charges: {molblocks_and_charges[0][1][:5]}... (first 5)")
     print(f"  Charge sum: {sum(molblocks_and_charges[0][1]):.6f}")
 
-    # Profiling report
     if args.profile:
         profiler.report()
 
